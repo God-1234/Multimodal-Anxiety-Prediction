@@ -1,0 +1,439 @@
+import os
+import numpy as np
+import pandas as pd
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras import layers, models, optimizers
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
+from sklearn.metrics import f1_score, recall_score, confusion_matrix
+from transformers import BertTokenizer, TFBertModel
+from tqdm import tqdm
+from tensorflow.keras.regularizers import l2
+
+# =========================== 1. 全局配置==========================
+# 路径配置
+DATA_DIR = r"F:\E-DAIC"  # Transcript.csv所在目录
+BERT_PATH = r"F:\E-DAIC\bert-base-uncased"  # BERT模型路径
+MODEL_DIR = r"F:\model1"  # 模型保存目录
+CACHE_DIR = r"F:\E-DAIC\bert_cache"  # BERT缓存目录
+os.makedirs(MODEL_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# 对齐核心配置（
+FPS = 30  # OpenFace帧率（固定，每秒钟30帧）
+MAX_LEN = 128  # BERT文本截断长度
+MIN_SEGMENT_DURATION = 1
+MAX_SEGMENT_DURATION = 15
+SEGMENT_FEAT_DIM = None  # 段级AU特征维度（自动推导）
+
+# 标签配置
+labels_df = pd.read_csv(os.path.join(DATA_DIR, "detailed_lables.csv"))  # 标签文件
+labels_df['anxiety_label'] = (labels_df['Depression_severity'] > 10) | (labels_df['PTSD_severity'] > 30).astype(int)
+
+# =========================== 2. BERT模型初始化 ===========================
+print(" 正在加载 BERT 模型（用于提取段级文本特征）...")
+tokenizer = BertTokenizer.from_pretrained(BERT_PATH)
+bert_model = TFBertModel.from_pretrained(BERT_PATH, from_pt=True)
+print(" BERT 模型加载完成")
+
+
+# =========================== 3. 文本embedding缓存（避免重复计算） ===========================
+def get_text_embedding(text_list, pid):
+    """为每个患者的每段对话提取BERT embedding，缓存到本地"""
+    save_path = os.path.join(CACHE_DIR, f"{pid}_bert.npy")
+    if os.path.exists(save_path):
+        return np.load(save_path)  # 已缓存，直接加载
+
+    # 未缓存，提取embedding（每段对话对应一个embedding）
+    embeddings = []
+    for text in tqdm(text_list, desc=f" 提取患者{pid}文本embedding", leave=False):
+        if not isinstance(text, str) or len(text.strip()) == 0:
+            embeddings.append(np.zeros(bert_model.config.hidden_size))  # 空文本补0
+            continue
+        # BERT编码（固定长度，截断/补全）
+        encoded = tokenizer(
+            text,
+            max_length=MAX_LEN,
+            padding='max_length',
+            truncation=True,
+            return_tensors='tf'
+        )
+        # 提取CLS token的embedding（段级文本特征）
+        outputs = bert_model(encoded['input_ids'], attention_mask=encoded['attention_mask'])
+        cls_emb = outputs.last_hidden_state[:, 0, :].numpy()[0]  # 取第一个样本的CLS特征
+        embeddings.append(cls_emb)
+
+    # 保存缓存，后续复用
+    embeddings = np.array(embeddings, dtype=np.float32)
+    np.save(save_path, embeddings)
+    return embeddings
+
+
+# =========================== 4. 核心：段级AU与文本精准对齐 ===========================
+def extract_aligned_au_text_features(pid):
+    """
+    为单个患者提取对齐的AU特征和文本特征：
+    1. 自动从文本文件提取时间戳
+    2. 自动转换时间戳→OpenFace帧索引
+    3. 自动截取对应AU数据并验证有效性
+    4. 输出可视化匹配日志，清晰展示对应关系
+    """
+    # 1. 定义文件路径
+    au_dir = os.path.join(DATA_DIR, f"{pid}_P", "features")
+    au_path = os.path.join(au_dir, f"{pid}_OpenFace2.1.0_Pose_gaze_AUs_openface_f16.npy")
+    transcript_path = os.path.join(DATA_DIR, f"{pid}_P", f"{pid}_Transcript.csv")
+
+    # 2. 过滤缺失文件的情况
+    if not os.path.exists(au_path):
+        print(f" 患者{pid}缺失OpenFace AU文件（路径：{au_path}），跳过")
+        return None
+    if not os.path.exists(transcript_path):
+        print(f" 患者{pid}缺失文本文件（路径：{transcript_path}），跳过")
+        return None
+
+    # 3. 加载OpenFace的AU数据（所有帧，后续按段自动截取）
+    au_data = np.load(au_path).astype(np.float32)
+    au_data = np.nan_to_num(au_data, nan=0.0, posinf=0.0, neginf=0.0)  # 处理NaN和异常值
+    global SEGMENT_FEAT_DIM
+    SEGMENT_FEAT_DIM = au_data.shape[1]  # 记录单帧AU特征维度
+    au_total_seconds = round(au_data.shape[0] / FPS, 2)
+    print(f"️ 患者{pid}的OpenFace AU数据：共{au_data.shape[0]}帧（{au_total_seconds}秒），每帧{SEGMENT_FEAT_DIM}维特征")
+
+    # 4. 加载文本数据（自动提取时间戳和文本内容）
+    transcript_df = pd.read_csv(transcript_path)
+    # 验证文本文件列名（确保包含必要的时间戳列）
+    required_cols = ['Start_Time', 'End_Time', 'Text']
+    if not all(col in transcript_df.columns for col in required_cols):
+        print(f" 患者{pid}文本文件列名不匹配，需要{required_cols}，实际有{transcript_df.columns.tolist()}，跳过")
+        return None
+    # 自动提取文本列表和时间戳（一一对应，按行顺序）
+    text_list = transcript_df['Text'].fillna("").tolist()
+    start_times = transcript_df['Start_Time'].tolist()
+    end_times = transcript_df['End_Time'].tolist()
+    total_segments = len(text_list)
+    print(f"️ 患者{pid}共加载{total_segments}段对话（筛选条件：{MIN_SEGMENT_DURATION}-{MAX_SEGMENT_DURATION}秒）")
+
+    # 5. 提取段级文本embedding（每段对话对应一个embedding）
+    text_embeddings = get_text_embedding(text_list, pid)
+    if len(text_embeddings) != total_segments:
+        print(f"患者{pid}文本embedding数量（{len(text_embeddings)}）与对话段数（{total_segments}）不匹配，跳过")
+        return None
+
+    # 6. 核心：自动对齐文本时间戳与AU数据
+    aligned_au_features = []  # 对齐后的段级AU特征
+    aligned_text_embeddings = []  # 对齐后的段级文本embedding
+    aligned_labels = []  # 对齐后的标签
+    valid_segment_count = 0  # 有效段计数器
+
+    # 获取当前患者的标签（若未找到，默认标记为0）
+    patient_label = labels_df.loc[labels_df['Participant'] == pid, 'anxiety_label'].values
+    patient_label = patient_label[0] if len(patient_label) > 0 else 0
+
+    # 遍历每一段对话，自动完成时间→AU的匹配
+    for i in range(total_segments):
+        start_time = start_times[i]
+        end_time = end_times[i]
+        current_text_emb = text_embeddings[i]
+        segment_duration = end_time - start_time
+
+        # （1）过滤时长异常的段（按优化后的阈值）
+        if not (MIN_SEGMENT_DURATION <= segment_duration <= MAX_SEGMENT_DURATION):
+            print(
+                f"️ 患者{pid}第{i + 1}段对话时长异常（{segment_duration:.1f}秒），跳过（需{MIN_SEGMENT_DURATION}-{MAX_SEGMENT_DURATION}秒）")
+            continue
+
+        # （2）自动转换：时间戳→OpenFace帧索引（核心匹配逻辑）
+        start_frame = int(start_time * FPS)
+        end_frame = int(end_time * FPS)
+
+        # （3）过滤帧索引异常（避免超出AU数据总帧数）
+        if start_frame < 0 or end_frame <= start_frame or end_frame > au_data.shape[0]:
+            print(f"️ 患者{pid}第{i + 1}段对话帧区间无效（{start_frame}-{end_frame}帧），跳过（总帧数：{au_data.shape[0]}）")
+            continue
+
+        # （4）可视化打印：清晰展示「文本时间→帧索引→AU数据」的对应关系
+        frame_count = end_frame - start_frame
+        print(
+            f"️ 自动匹配：第{i + 1}段 → 文本时间[{start_time:.2f}秒 - {end_time:.2f}秒] → OpenFace帧[{start_frame} - {end_frame}] → 对应AU数据{frame_count}帧")
+
+        # （5）自动截取当前段对应的AU数据（核心：获取对应时间的AU特征）
+        au_segment = au_data[start_frame:end_frame]
+
+        # （6）提取段级AU特征（保留微表情的整体趋势和关键细节）
+        segment_au_feat = np.concatenate([
+            np.mean(au_segment, axis=0),  # 段内均值：整体微表情趋势
+            np.std(au_segment, axis=0),  # 段内标准差：微表情波动程度
+            np.max(au_segment, axis=0),  # 段内最大值：关键峰值微表情
+            np.min(au_segment, axis=0),  # 段内最小值：关键谷值微表情
+            np.median(au_segment, axis=0),  # 段内中位数：抗噪的趋势特征
+            au_segment[0],  # 起始帧：段开始时的微表情
+            au_segment[-1]  # 结束帧：段结束时的微表情
+        ], axis=0)
+
+        # （7）保存对齐后的数据（一一对应，用于后续模型训练）
+        aligned_au_features.append(segment_au_feat)
+        aligned_text_embeddings.append(current_text_emb)
+        aligned_labels.append(patient_label)
+        valid_segment_count += 1
+        print(f"患者{pid}第{i + 1}段对话对齐完成（时长：{segment_duration:.1f}秒，有效段数：{valid_segment_count}）")
+
+    # 7. 验证有效段数
+    if valid_segment_count == 0:
+        print(f" 患者{pid}无有效对齐段，跳过")
+        return None
+    if valid_segment_count < 50:
+        print(f" 患者{pid}有效段数较少（{valid_segment_count}段），建议添加更多患者数据或微调时长阈值")
+    else:
+        print(f"患者{pid}对齐完成：共{valid_segment_count}段有效数据（符合目标要求）")
+
+    # 8. 转换为numpy数组（供模型输入）
+    au_array = np.array(aligned_au_features, dtype=np.float32)
+    text_array = np.array(aligned_text_embeddings, dtype=np.float32)
+    label_array = np.array(aligned_labels, dtype=np.int32)
+
+    return au_array, text_array, label_array
+
+
+# =========================== 5. 数据准备（整合所有患者的对齐数据） ===========================
+def prepare_all_data(patient_ids):
+    """整合所有患者的对齐数据（AU特征+文本特征+标签）"""
+    all_au = []
+    all_text = []
+    all_labels = []
+
+    for pid in tqdm(patient_ids, desc="整合所有患者的对齐数据"):
+        # 提取单个患者的对齐数据
+        patient_data = extract_aligned_au_text_features(pid)
+        if patient_data is None:
+            continue  # 跳过无效患者
+        au, text, labels = patient_data
+        # 添加到全局数据中
+        all_au.append(au)
+        all_text.append(text)
+        all_labels.append(labels)
+
+    # 验证总数据量
+    if len(all_au) == 0:
+        raise ValueError("未加载到任何有效对齐数据，请检查文件路径和格式！")
+    total_segments = sum([len(au) for au in all_au])
+    print(f"\n数据准备完成：共{len(all_au)}个有效患者，{total_segments}段对齐数据")
+
+    # 拼接为全局数组（模型输入格式）
+    all_au = np.concatenate(all_au, axis=0)  # 形状：(总段数, 段级AU维度)
+    all_text = np.concatenate(all_text, axis=0)  # 形状：(总段数, BERT维度)
+    all_labels = np.concatenate(all_labels, axis=0)  # 形状：(总段数,)
+
+    # 标准化AU特征（消除量纲影响，提升模型收敛速度）
+    scaler = StandardScaler()
+    all_au_scaled = scaler.fit_transform(all_au)
+    print(f" AU特征标准化完成：原始维度{all_au.shape}，标准化后维度{all_au_scaled.shape}")
+
+    return all_au_scaled, all_text, all_labels, scaler
+
+
+# =========================== 6. 构建微表情分类模型（适配段级对齐数据） ===========================
+def build_emotion_model(au_dim, text_dim):
+    """构建“AU特征+文本特征”融合的微表情分类模型"""
+    # （1）AU特征分支（处理段级微表情特征）
+    au_input = layers.Input(shape=(au_dim,), name="au_input")
+    au_branch = layers.Dense(256, activation='relu', kernel_regularizer=l2(1e-4))(au_input)
+    au_branch = layers.Dropout(0.4)(au_branch)  # 防止过拟合
+    au_branch = layers.Dense(128, activation='relu', kernel_regularizer=l2(1e-4))(au_branch)
+    au_branch = layers.Dropout(0.3)(au_branch)
+
+    # （2）文本特征分支（处理段级BERT embedding）
+    text_input = layers.Input(shape=(text_dim,), name="text_input")
+    text_branch = layers.Dense(128, activation='relu', kernel_regularizer=l2(1e-4))(text_input)
+    text_branch = layers.Dropout(0.3)(text_branch)  # 防止过拟合
+
+    # （3）特征融合（结合微表情和文本信息）
+    fused = layers.Concatenate(name="feature_fusion")([au_branch, text_branch])
+    fused = layers.Dense(64, activation='relu', kernel_regularizer=l2(1e-4))(fused)
+    fused = layers.Dropout(0.2)(fused)
+
+    # （4）输出层（二分类：焦虑/非焦虑）
+    output = layers.Dense(1, activation='sigmoid', name="output")(fused)
+
+    # （5）编译模型
+    model = models.Model(inputs=[au_input, text_input], outputs=output)
+    model.compile(
+        optimizer=optimizers.Adam(learning_rate=1e-4),  # 学习率适配段级数据
+        loss='binary_crossentropy',  # 二分类损失函数
+        metrics=['accuracy']  # 基础评估指标
+    )
+
+    # 打印模型结构
+    model.summary()
+    return model
+
+
+# =========================== 7. 模型训练（K-Fold交叉验证，确保稳定性） ===========================
+def train_model(all_au, all_text, all_labels, n_splits=5):
+    """用K-Fold交叉验证训练模型，评估泛化能力"""
+    # 初始化K-Fold（打乱数据，确保每折分布一致）
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    fold_results = []  # 记录每折的性能
+
+    # 修正：遍历K-Fold时，正确获取fold_idx和索引
+    for fold_idx, (train_idx, val_idx) in enumerate(kf.split(all_au)):
+        print(f"\n========== 开始训练第{fold_idx + 1}/{n_splits}折 ==========")
+        # 划分训练集和验证集（按段级数据划分，确保患者数据不跨折泄露）
+        train_au, val_au = all_au[train_idx], all_au[val_idx]
+        train_text, val_text = all_text[train_idx], all_text[val_idx]
+        train_labels, val_labels = all_labels[train_idx], all_labels[val_idx]
+
+        # 打印当前折的数据量
+        print(f"第{fold_idx + 1}折训练数据：{len(train_labels)}段；验证数据：{len(val_labels)}段")
+        train_pos_count = np.sum(train_labels)
+        train_neg_count = len(train_labels) - train_pos_count
+        val_pos_count = np.sum(val_labels)
+        val_neg_count = len(val_labels) - val_pos_count
+        print(f"第{fold_idx + 1}折训练集标签分布：焦虑{train_pos_count}段，非焦虑{train_neg_count}段")
+        print(f"第{fold_idx + 1}折验证集标签分布：焦虑{val_pos_count}段，非焦虑{val_neg_count}段")
+
+        # 核心优化：校验训练集/验证集是否为单一标签（规避后续报错）
+        is_train_single_label = (train_pos_count == 0) or (train_neg_count == 0)
+        is_val_single_label = (val_pos_count == 0) or (val_neg_count == 0)
+        if is_train_single_label:
+            print(f" 第{fold_idx + 1}折训练集为单一标签，模型训练可能过拟合用")
+        if is_val_single_label:
+            print(f" 第{fold_idx + 1}折验证集为单一标签，无法计算F1/召回率，跳过评估环节")
+
+        # 构建模型
+        model = build_emotion_model(
+            au_dim=all_au.shape[1],
+            text_dim=all_text.shape[1]
+        )
+
+        # 定义回调函数（早停防止过拟合，保存最优模型）
+        callbacks = [
+            EarlyStopping(
+                monitor='val_loss',  # 监控验证集损失
+                patience=8,  # 连续8轮无提升则停止
+                restore_best_weights=True,  # 恢复最优权重
+                mode='min',
+                verbose=1
+            ),
+            ModelCheckpoint(
+                filepath=os.path.join(MODEL_DIR, f"best_model_fold{fold_idx + 1}.h5"),
+                monitor='val_loss',
+                save_best_only=True,  # 只保存最优模型
+                mode='min',
+                verbose=1
+            )
+        ]
+
+        # 计算类别权重（处理可能的类别不平衡）
+        class_weight = {0: 1.0, 1: train_neg_count / max(train_pos_count, 1)}  # 少数类权重提升
+        print(f" 第{fold_idx + 1}折类别权重：非焦虑{class_weight[0]}，焦虑{class_weight[1]}")
+
+        # 模型训练
+        history = model.fit(
+            [train_au, train_text], train_labels,
+            validation_data=([val_au, val_text], val_labels),
+            epochs=50,  # 足够的轮数让模型收敛
+            batch_size=32,  # 适配段级数据
+            class_weight=class_weight,
+            callbacks=callbacks,
+            verbose=1
+        )
+
+        # 优化评估逻辑：仅当验证集非单一标签时，计算F1/召回率/混淆矩阵
+        fold_result = {
+            "fold": fold_idx + 1,
+            "f1": 0.0,
+            "recall": 0.0,
+            "confusion_matrix": None,
+            "train_history": history.history
+        }
+
+        if not is_val_single_label:
+            # 评估当前折的性能（F1值和召回率，更适合分类任务）
+            val_pred = (model.predict([val_au, val_text], verbose=0) > 0.5).astype(int)
+            fold_result["f1"] = f1_score(val_labels, val_pred, zero_division=0)  # 处理零除法警告
+            fold_result["recall"] = recall_score(val_labels, val_pred, zero_division=0)  # 处理零除法警告
+            fold_result["confusion_matrix"] = confusion_matrix(val_labels, val_pred)
+
+            # 打印当前折结果
+            print(f"\n========== 第{fold_idx + 1}折训练完成 ==========")
+            print(f"F1值：{fold_result['f1']:.4f}")
+            print(f"召回率：{fold_result['recall']:.4f}")
+            print(f"混淆矩阵：")
+            cm = fold_result["confusion_matrix"]
+            print(f"非焦虑预测：正确{cm[0][0]}，错误{cm[0][1]}")
+            print(f"焦虑预测：正确{cm[1][1]}，错误{cm[1][0]}")
+        else:
+            # 单一标签场景的打印逻辑（避免索引越界）
+            print(f"\n========== 第{fold_idx + 1}折训练完成 ==========")
+            print(f"F1值：无法计算（验证集单一标签）")
+            print(f"召回率：无法计算（验证集单一标签）")
+            print(f"混淆矩阵：无法生成（验证集单一标签）")
+
+        fold_results.append(fold_result)
+
+    # 计算平均性能（整体模型效果）
+    valid_f1 = [res["f1"] for res in fold_results if res["f1"] > 0.0]
+    valid_recall = [res["recall"] for res in fold_results if res["recall"] > 0.0]
+    avg_f1 = np.mean(valid_f1) if len(valid_f1) > 0 else 0.0
+    avg_recall = np.mean(valid_recall) if len(valid_recall) > 0 else 0.0
+
+    print(f"\n========== 所有折训练完成 ==========")
+    print(f"平均F1值：{avg_f1:.4f}（仅统计非单一标签折）")
+    print(f"平均召回率：{avg_recall:.4f}（仅统计非单一标签折）")
+    print(f"最优模型保存路径：{MODEL_DIR}")
+
+    return fold_results, model
+
+
+# =========================== 8. 主函数：一键运行所有流程 ===========================
+if __name__ == "__main__":
+    # 步骤1：定义固定ID范围（300到718），逐个验证文件夹有效性
+    start_pid = 300  # 起始患者ID
+    end_pid = 718  # 结束患者ID
+    patient_ids = []
+
+    # 遍历300到718的所有ID，逐一检查对应文件夹
+    for pid in range(start_pid, end_pid + 1):
+        # 拼接对应文件夹名称（格式：xxx_P）
+        patient_folder = f"{pid}_P"
+        patient_folder_path = os.path.join(DATA_DIR, patient_folder)
+
+        # 双重验证：1. 文件夹是否存在 2. 文件夹是否非空（避免空文件夹占用ID）
+        if os.path.exists(patient_folder_path):
+            # 可选：进一步验证文件夹内是否有核心数据文件（提升有效性，可根据需求调整）
+            has_core_files = False
+            # 检查是否有OpenFace AU文件和文本文件（核心数据，缺一不可）
+            for file_name in os.listdir(patient_folder_path):
+                if file_name.endswith("_OpenFace2.1.0_Pose_gaze_AUs_openface_f16.npy") or \
+                        file_name.endswith("_Transcript.csv"):
+                    has_core_files = True
+                    break
+            # 若文件夹存在且包含核心数据，加入有效ID列表
+            if has_core_files:
+                patient_ids.append(pid)
+            else:
+                print(f"️ 患者{pid}文件夹存在，但无核心数据文件，跳过")
+        else:
+            # 文件夹不存在，直接跳过，不打印冗余日志（如需排查可取消注释）
+            # print(f" 患者{pid}文件夹不存在，跳过")
+            continue
+
+    # 可选：排序患者ID（确保顺序从300到718，符合预期）
+    patient_ids.sort()
+
+    # 打印统计信息，确认有效患者数量
+    total_expected = end_pid - start_pid + 1
+    total_valid = len(patient_ids)
+    print(f" 成功识别 {total_valid} 个有效患者（区间：{start_pid}-{end_pid}，共{total_expected}个ID）")
+    print(f"️ 跳过 {total_expected - total_valid} 个无数据/无效ID")
+
+    # 步骤2：准备所有患者的对齐数据
+    all_au, all_text, all_labels, scaler = prepare_all_data(patient_ids)
+
+    # 步骤3：训练微表情模型（K-Fold交叉验证）
+    fold_results, final_model = train_model(all_au, all_text, all_labels, n_splits=5)
+
+    # 步骤4：保存标准化器
+    scaler_save_path = os.path.join(MODEL_DIR, "au_scaler.npy")
+    np.save(scaler_save_path, [scaler.mean_, scaler.scale_])
+    print(f"\n 标准化器保存完成（路径：{scaler_save_path}）")

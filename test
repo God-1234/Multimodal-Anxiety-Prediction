@@ -1,0 +1,98 @@
+import numpy as np
+from mmsdk import mmdatasdk
+from tensorflow.keras.models import load_model
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+import torch
+from transformers import BertTokenizer, BertModel
+import warnings
+warnings.filterwarnings("ignore")
+
+# ======================
+# 固定配置
+# ======================
+VIS_DIM = 371
+TXT_DIM = 768
+BERT_PATH = r"F:\"
+
+# ======================
+# 加载BERT
+# ======================
+print("✅ Loading BERT...")
+tokenizer = BertTokenizer.from_pretrained(BERT_PATH)
+bert_model = BertModel.from_pretrained(BERT_PATH)
+bert_model.eval()
+
+def get_bert_embedding(words_list):
+    words = [str(word[0]) for word in words_list]
+    text = " ".join(words)
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=128)
+    with torch.no_grad():
+        outputs = bert_model(**inputs)
+    return outputs.last_hidden_state[:, 0, :].squeeze().numpy()
+
+# ======================
+# 加载数据
+# ======================
+print("✅ Loading CMU-MOSEI...")
+dataset = mmdatasdk.mmdataset({
+    "OpenFace2": r"E:\CMU-MOSWI\archive\CMU-MOSEI\visuals\CMU_MOSEI_VisualOpenFace2.csd",
+    "words": r"E:\CMU-MOSWI\archive\CMU-MOSEI\languages\CMU_MOSEI_TimestampedWords.csd",
+    "labels": r"E:\CMU-MOSWI\archive\CMU-MOSEI\labels\CMU_MOSEI_Labels.csd"
+})
+
+# ======================
+# 只取有标签的样本
+# ======================
+valid_ids = []
+all_ids = list(dataset["OpenFace2"].data.keys())
+label_data = dataset["labels"].data
+
+for sid in all_ids:
+    if sid in label_data:
+        valid_ids.append(sid)
+#读前一百
+sample_ids = valid_ids[:100]
+print(f"✅ 有效测试样本：{len(sample_ids)}")
+
+# ======================
+# 提取特征
+# ======================
+X_vision, X_text, y_true = [], [], []
+
+for i, sid in enumerate(sample_ids):
+    if i % 100 == 0:
+        print(f"Processing {i}/{len(sample_ids)}")
+
+    # 视觉
+    v = np.array(dataset["OpenFace2"].data[sid]["features"])
+    v = np.mean(v, axis=0)[:VIS_DIM]
+    X_vision.append(v)
+
+    # 文本
+    words = dataset["words"].data[sid]["features"]
+    X_text.append(get_bert_embedding(words))
+
+    # 标签
+    l = np.array(dataset["labels"].data[sid]["features"])
+    y_true.append(1 if np.mean(l) > 0 else 0)
+
+# ======================
+# 形状对齐
+# ======================
+X_vision = np.array(X_vision)
+X_text = np.array(X_text)
+y_true = np.array(y_true)
+
+from tensorflow.keras import backend as K
+
+def loss(y_true, y_pred):
+    # 这里只需要占位，不需要真实实现，加载模型用
+    return K.binary_crossentropy(y_true, y_pred)
+
+print("Predicting...")
+model = load_model(
+    r"F:\model1\best_model_fold_4.h5",
+    custom_objects={"loss": loss}  # 注册自定义损失
+)
+y_pred = model.predict([X_vision, X_text], verbose=1)
+y_pred_bin = (y_pred > 0.5).astype(int).flatten()

@@ -12,10 +12,10 @@ from tensorflow.keras.regularizers import l2
 
 # =========================== 1. 全局配置==========================
 # 路径配置
-DATA_DIR = r"F:\E-DAIC"  # Transcript.csv所在目录
-BERT_PATH = r"F:\E-DAIC\bert-base-uncased"  # BERT模型路径
-MODEL_DIR = r"F:\model1"  # 模型保存目录
-CACHE_DIR = r"F:\E-DAIC\bert_cache"  # BERT缓存目录
+DATA_DIR = r"F:\"  # Transcript.csv所在目录
+BERT_PATH = r"F:\"  # BERT模型路径
+MODEL_DIR = r"F:\"  # 模型保存目录
+CACHE_DIR = r"F:\"  # BERT缓存目录
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
